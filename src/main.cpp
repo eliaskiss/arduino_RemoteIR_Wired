@@ -22,10 +22,10 @@
 #include "web_page.h"
 
 // ─────────── 네트워크 설정 ───────────
-byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED };
-IPAddress ip(192, 168, 1, 100);
-IPAddress gateway(192, 168, 1, 1);
-IPAddress subnet(255, 255, 255, 0);
+byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x06 };
+IPAddress ip(192, 168, 0, 76);
+IPAddress gateway(192, 168, 0, 1);
+IPAddress subnet(255, 255, 255, 255);
 
 EthernetServer server(80);
 
@@ -235,6 +235,7 @@ bool sendIrSignal(uint8_t moduleIndex, const char* protocol,
         IrSender.sendSamsung(address, command, 0);
     } else {
         Serial.println(F("  Unknown protocol"));
+        moduleStatus[moduleIndex].lastSuccess = false;
         return false;
     }
 
@@ -309,7 +310,6 @@ uint8_t parseModuleId(const char* url) {
     // /api/ir/ = 8 chars
     if (strncmp(url, "/api/ir/", 8) != 0) return 0;
     const char* p = url + 8;
-    if (*p == 'a') return 0; // "all"
     int id = atoi(p);
     if (id < 1 || id > IR_MODULE_COUNT) return 0;
     return (uint8_t)id;
@@ -358,6 +358,7 @@ void handleSendIr(EthernetClient& client, const char* body,
     char protocol[12] = "NEC";
     uint16_t address = LG_ADDRESS;
     uint8_t  command = 0;
+    bool haveCmd = false;
 
     // "key" 파라미터 우선 확인
     char keyStr[16] = "";
@@ -368,10 +369,12 @@ void handleSendIr(EthernetClient& client, const char* body,
             return;
         }
         command = mapping->irCode;
+        haveCmd = true;
         // key 모드에서도 protocol/address 오버라이드 허용
         char proto[12];
         if (jsonGetString(body, "protocol", proto, sizeof(proto))) {
             strncpy(protocol, proto, sizeof(protocol) - 1);
+            protocol[sizeof(protocol) - 1] = '\0';
         }
         char addrStr[12];
         if (jsonGetString(body, "address", addrStr, sizeof(addrStr))) {
@@ -382,13 +385,21 @@ void handleSendIr(EthernetClient& client, const char* body,
         char proto[12], addrStr[12], cmdStr[12];
         if (jsonGetString(body, "protocol", proto, sizeof(proto))) {
             strncpy(protocol, proto, sizeof(protocol) - 1);
+            protocol[sizeof(protocol) - 1] = '\0';
         }
         if (jsonGetString(body, "address", addrStr, sizeof(addrStr))) {
             address = parseHexOrDec(addrStr);
         }
         if (jsonGetString(body, "command", cmdStr, sizeof(cmdStr))) {
             command = (uint8_t)parseHexOrDec(cmdStr);
+            haveCmd = true;
         }
+    }
+
+    if (!haveCmd) {
+        sendJsonError(client, 400, "Bad Request",
+                      "Missing 'key' or 'command'");
+        return;
     }
 
     if (singleId > 0) {
@@ -427,7 +438,14 @@ void drainAndClose(EthernetClient& client) {
 
 // ─────────── Setup ───────────
 void setup() {
-    Serial.begin(115200);
+    // Serial.begin(115200);
+    Serial.begin(9600);
+
+    // For Debugging
+    // while(!Serial){
+    //     delay(100);
+    // }
+    
     delay(1000);
 
     Serial.println(F("=== IR Control System ==="));
@@ -448,6 +466,24 @@ void setup() {
 
     // Ethernet 초기화
     Ethernet.begin(mac, ip, gateway, gateway, subnet);
+    Serial.print(F("MAC: "));
+    for (uint8_t i = 0; i < 6; i++) {
+        if (mac[i] < 0x10) Serial.print('0');
+        Serial.print(mac[i], HEX);
+        if (i < 5) Serial.print(':');
+    }
+    Serial.println();
+
+    // Ethernet 하드웨어 / 링크 상태 확인
+    if (Ethernet.hardwareStatus() == EthernetNoHardware) {
+        Serial.println(F("Ethernet shield NOT found!"));
+    } else if (Ethernet.linkStatus() == LinkOFF) {
+        Serial.println(F("Ethernet cable NOT connected."));
+    } else {
+        Serial.print(F("Ethernet CONNECTED — IP: "));
+        Serial.println(Ethernet.localIP());
+    }
+
     Serial.print(F("IP: "));
     Serial.println(Ethernet.localIP());
 
@@ -462,10 +498,23 @@ void loop() {
     // Ethernet 링크 유지
     Ethernet.maintain();
 
+    // 링크 상태 변화 감지 — 연결되는 순간 Serial 출력
+    static EthernetLinkStatus lastLink = Unknown;
+    EthernetLinkStatus link = Ethernet.linkStatus();
+    if (link != lastLink) {
+        lastLink = link;
+        if (link == LinkON) {
+            Serial.print(F("Ethernet CONNECTED — IP: "));
+            Serial.println(Ethernet.localIP());
+        } else if (link == LinkOFF) {
+            Serial.println(F("Ethernet DISCONNECTED."));
+        }
+    }
+
     EthernetClient client = server.available();
     if (!client) return;
 
-    // ── 헤더 읽기 (최대 2KB) ──
+    // ── 헤더 읽기 (최대 512B, SRAM 절약) ──
     char headers[512];
     uint16_t hLen = 0;
     unsigned long timeout = millis() + 3000;
@@ -516,16 +565,24 @@ void loop() {
     }
 
     // ── Content-Length + POST body 읽기 ──
+    // Content-Length 없거나 본문이 body[] 버퍼보다 크면 즉시 거절.
+    // (없는 경우 handleSendIr이 기본값 command=0으로 의도치 않은 IR을 쏘는 것을 방지)
     char body[256] = "";
     if (strcmp(method, "POST") == 0) {
-        int contentLength = 0;
         const char* cl = strstr(headers, "Content-Length: ");
         if (!cl) cl = strstr(headers, "content-length: ");
-        if (cl) {
-            contentLength = atoi(cl + 16);
+        if (!cl) {
+            sendJsonError(client, 411, "Length Required",
+                          "Content-Length required");
+            drainAndClose(client);
+            return;
         }
-        if (contentLength > (int)sizeof(body) - 1) {
-            contentLength = sizeof(body) - 1;
+        int contentLength = atoi(cl + 16);
+        if (contentLength < 0 || contentLength > (int)sizeof(body) - 1) {
+            sendJsonError(client, 413, "Payload Too Large",
+                          "Body exceeds 255 bytes");
+            drainAndClose(client);
+            return;
         }
 
         uint16_t bLen = 0;
@@ -567,8 +624,8 @@ void loop() {
         // PROGMEM에서 청크 단위로 전송 (메모리 절약)
         const uint16_t chunkSize = 256;
         uint16_t totalLen = strlen_P(HTML_PAGE);
+        char buf[chunkSize + 1];
         for (uint16_t i = 0; i < totalLen; i += chunkSize) {
-            char buf[chunkSize + 1];
             uint16_t len = min((uint16_t)chunkSize, (uint16_t)(totalLen - i));
             memcpy_P(buf, HTML_PAGE + i, len);
             buf[len] = '\0';
