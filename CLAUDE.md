@@ -47,3 +47,5 @@ POST body: `{"protocol":"NEC","address":"0x04","command":"0x08"}`
 ## Network Defaults
 
 IP: `192.168.1.100`, Gateway: `192.168.1.1`, MAC: `DE:AD:BE:EF:FE:ED`, Port: `80` — `main.cpp` 상단 상수로 변경 가능
+
+**`USE_DHCP` 플래그** (`main.cpp` 상단): `true`이면 DHCP로 IP/게이트웨이/서브넷 자동 획득(10초 타임아웃, 성공 시 할당 IP를 시리얼 출력), `false`(기본값)이면 위 static 상수 사용. DHCP 실패 시 진단 메시지 출력 후 부팅을 계속 진행한다.

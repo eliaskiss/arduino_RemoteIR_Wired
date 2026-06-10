@@ -22,8 +22,12 @@
 #include "web_page.h"
 
 // ─────────── 네트워크 설정 ───────────
-byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x06 };
-IPAddress ip(192, 168, 0, 76);
+// USE_DHCP == true  : DHCP로 IP/게이트웨이/서브넷 자동 획득
+// USE_DHCP == false : 아래 static ip/gateway/subnet 사용 (기본값, 기존 동작)
+constexpr bool USE_DHCP = false;
+
+byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x05 };
+IPAddress ip(192, 168, 0, 75);
 IPAddress gateway(192, 168, 0, 1);
 IPAddress subnet(255, 255, 255, 255);
 
@@ -464,8 +468,21 @@ void setup() {
         moduleStatus[i].lastSuccess = false;
     }
 
-    // Ethernet 초기화
-    Ethernet.begin(mac, ip, gateway, gateway, subnet);
+    // Ethernet 초기화 — USE_DHCP 플래그에 따라 모드 분기
+    if (USE_DHCP) {
+        Serial.println(F("Network mode: DHCP"));
+        // 짧은 타임아웃(10초)으로 DHCP 시도 — 실패 시 부팅이 오래 멈추지 않도록
+        if (Ethernet.begin(mac, 10000)) {
+            Serial.print(F("DHCP IP: "));
+            Serial.println(Ethernet.localIP());
+        } else {
+            Serial.println(F("DHCP failed (timeout/no server)"));
+        }
+    } else {
+        Serial.println(F("Network mode: STATIC"));
+        Ethernet.begin(mac, ip, gateway, gateway, subnet);
+    }
+
     Serial.print(F("MAC: "));
     for (uint8_t i = 0; i < 6; i++) {
         if (mac[i] < 0x10) Serial.print('0');
