@@ -26,8 +26,8 @@
 // USE_DHCP == false : 아래 static ip/gateway/subnet 사용 (기본값, 기존 동작)
 constexpr bool USE_DHCP = false;
 
-byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x05 };
-IPAddress ip(192, 168, 0, 75);
+byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x04 };
+IPAddress ip(192, 168, 0, 74);
 IPAddress gateway(192, 168, 0, 1);
 IPAddress subnet(255, 255, 255, 0);
 
@@ -208,8 +208,123 @@ struct ModuleStatus {
 
 ModuleStatus moduleStatus[IR_MODULE_COUNT];
 
-// ─────────── IR 전송 ───────────
-bool sendIrSignal(uint8_t moduleIndex, const char* protocol,
+// ─────────── 튜닝 상수 ───────────
+// 유실 진단용 추적 로그/카운터 토글 — 0이면 비활성. 추후 재테스트 시 1로 바꾼다.
+// (1로 켜면 [REQ]/[ENQ]/[DEQ]/[JOB DONE] 시리얼 로그와 /api/status 의 req/enq/full/done 노출)
+#define IR_TRACE 0
+
+constexpr uint32_t MODULE_GAP_MS          = 20;   // 큐 소비 시 송신 간 최소 간격
+constexpr uint8_t  IR_QUEUE_SIZE          = 64;   // 64 × sizeof(IrJob) ≈ 384B
+constexpr uint16_t IR_QUEUE_SRAM_BUDGET   = 4096; // 큐 정적 점유 상한(SRAM 가드)
+constexpr uint32_t HEADER_READ_TIMEOUT_MS = 800;  // 헤더 읽기 타임아웃(기존 3000)
+constexpr uint32_t BODY_READ_TIMEOUT_MS   = 500;  // body 읽기 타임아웃(기존 2000)
+
+// ─────────── IR 작업 큐 ───────────
+enum IrProtocol : uint8_t {
+    PROTO_NEC, PROTO_SONY, PROTO_RC5, PROTO_RC6, PROTO_SAMSUNG, PROTO_UNKNOWN
+};
+
+struct IrJob {
+    uint8_t  target;    // 0 = 전체(all), 1..15 = 단일 모듈 id
+    uint8_t  protocol;  // IrProtocol
+    uint16_t address;
+    uint8_t  command;
+};
+
+// SRAM 폭주 방지 컴파일 가드 — 큐 정적 점유를 예산 이내로 강제
+static_assert(sizeof(IrJob) * IR_QUEUE_SIZE <= IR_QUEUE_SRAM_BUDGET,
+              "IR_QUEUE_SIZE too large — exceeds SRAM budget; reduce it");
+
+IrJob   irQueue[IR_QUEUE_SIZE];
+uint8_t qHead = 0, qTail = 0, qCount = 0;
+
+// 큐 소비 상태머신이 처리 중인 작업(디듀프 비교에도 사용)
+IrJob    curJob;
+bool     jobActive  = false;
+uint8_t  allIndex   = 0;   // 전체 송신 진행 인덱스
+uint8_t  allOk      = 0;   // 전체 송신 성공 모듈 수
+uint32_t lastSendMs = 0;
+
+#if IR_TRACE
+// ── 추적용 누적 카운터 (유실 진단, IR_TRACE 시에만) ──
+uint32_t reqSeq  = 0;   // 서버가 실제로 수신한 요청 수(헤더까지 도착)
+uint32_t enqSeq  = 0;   // enqueue 성공(적재)된 송신 작업 수
+uint32_t fullSeq = 0;   // 큐 포화로 거절(503)된 수
+uint32_t doneSeq = 0;   // 송신 완료된 작업 수
+#endif
+
+IrProtocol protocolFromString(const char* s) {
+    if (strcmp(s, "NEC")     == 0) return PROTO_NEC;
+    if (strcmp(s, "SONY")    == 0) return PROTO_SONY;
+    if (strcmp(s, "RC5")     == 0) return PROTO_RC5;
+    if (strcmp(s, "RC6")     == 0) return PROTO_RC6;
+    if (strcmp(s, "SAMSUNG") == 0) return PROTO_SAMSUNG;
+    return PROTO_UNKNOWN;
+}
+
+const char* protocolName(uint8_t p) {
+    switch (p) {
+        case PROTO_NEC:     return "NEC";
+        case PROTO_SONY:    return "SONY";
+        case PROTO_RC5:     return "RC5";
+        case PROTO_RC6:     return "RC6";
+        case PROTO_SAMSUNG: return "SAMSUNG";
+        default:            return "UNKNOWN";
+    }
+}
+
+// 키: target + protocol + address + command (완전히 동일한 IR 신호)
+bool sameKey(const IrJob& a, const IrJob& b) {
+    return a.target == b.target && a.protocol == b.protocol &&
+           a.address == b.address && a.command == b.command;
+}
+
+// 적재. 큐 포화 시 false.
+// NOTE: 연속 중복 디듀프는 잠시 비활성화 — 연속으로 들어와도 모두 적재한다.
+bool enqueueJob(const IrJob& job) {
+    if (qCount >= IR_QUEUE_SIZE) {
+#if IR_TRACE
+        fullSeq++;
+        Serial.print(F("[ENQ] FULL rejected  qCount="));
+        Serial.print(qCount);
+        Serial.print(F("  full#="));
+        Serial.println(fullSeq);
+#endif
+        return false;
+    }
+
+    // ── 연속 중복 디듀프 (일시 주석 처리) ──
+    // const IrJob* prev = nullptr;
+    // if (qCount > 0)      prev = &irQueue[(qTail + IR_QUEUE_SIZE - 1) % IR_QUEUE_SIZE];
+    // else if (jobActive) prev = &curJob;
+    // if (prev && sameKey(*prev, job)) return true;  // 연속 중복 → 적재 생략
+
+    irQueue[qTail] = job;
+    qTail = (qTail + 1) % IR_QUEUE_SIZE;
+    qCount++;
+#if IR_TRACE
+    enqSeq++;
+    Serial.print(F("[ENQ #"));
+    Serial.print(enqSeq);
+    Serial.print(F("] target="));
+    Serial.print(job.target);
+    Serial.print(F(" cmd=0x"));
+    Serial.print(job.command, HEX);
+    Serial.print(F("  qCount="));
+    Serial.println(qCount);
+#endif
+    return true;
+}
+
+IrJob dequeueJob() {
+    IrJob j = irQueue[qHead];
+    qHead = (qHead + 1) % IR_QUEUE_SIZE;
+    qCount--;
+    return j;
+}
+
+// ─────────── IR 전송 (serviceIrQueue 에서만 호출) ───────────
+bool sendIrSignal(uint8_t moduleIndex, uint8_t protocol,
                   uint16_t address, uint8_t command) {
     if (moduleIndex >= IR_MODULE_COUNT) return false;
 
@@ -221,32 +336,79 @@ bool sendIrSignal(uint8_t moduleIndex, const char* protocol,
     Serial.print(F("] pin="));
     Serial.print(pin);
     Serial.print(F(" proto="));
-    Serial.print(protocol);
+    Serial.print(protocolName(protocol));
     Serial.print(F(" addr=0x"));
     Serial.print(address, HEX);
     Serial.print(F(" cmd=0x"));
     Serial.println(command, HEX);
 
-    if (strcmp(protocol, "NEC") == 0) {
-        IrSender.sendNEC(address, command, 0);
-    } else if (strcmp(protocol, "SONY") == 0) {
-        IrSender.sendSony(address, command, 0);
-    } else if (strcmp(protocol, "RC5") == 0) {
-        IrSender.sendRC5(address, command, 0);
-    } else if (strcmp(protocol, "RC6") == 0) {
-        IrSender.sendRC6(address, command, 0);
-    } else if (strcmp(protocol, "SAMSUNG") == 0) {
-        IrSender.sendSamsung(address, command, 0);
-    } else {
-        Serial.println(F("  Unknown protocol"));
-        moduleStatus[moduleIndex].lastSuccess = false;
-        return false;
+    switch (protocol) {
+        case PROTO_NEC:     IrSender.sendNEC(address, command, 0);     break;
+        case PROTO_SONY:    IrSender.sendSony(address, command, 0);    break;
+        case PROTO_RC5:     IrSender.sendRC5(address, command, 0);     break;
+        case PROTO_RC6:     IrSender.sendRC6(address, command, 0);     break;
+        case PROTO_SAMSUNG: IrSender.sendSamsung(address, command, 0); break;
+        default:
+            Serial.println(F("  Unknown protocol"));
+            moduleStatus[moduleIndex].lastSuccess = false;
+            return false;
     }
 
     moduleStatus[moduleIndex].sendCount++;
     moduleStatus[moduleIndex].lastSuccess = true;
     Serial.println(F("  Sent OK"));
     return true;
+}
+
+// ─────────── 큐 소비 비블로킹 상태머신 ───────────
+// loop() 진입부에서 매 반복 호출. 송신 시점이 아니면 즉시 반환하여 다른 요청 수신을 막지 않는다.
+void serviceIrQueue() {
+    if (!jobActive) {
+        if (qCount == 0) return;
+        curJob = dequeueJob();
+        jobActive  = true;
+        allIndex   = 0;
+        allOk      = 0;
+        lastSendMs = millis() - MODULE_GAP_MS;  // 첫 송신 즉시 허용
+#if IR_TRACE
+        Serial.print(F("[DEQ] start target="));
+        Serial.print(curJob.target);
+        Serial.print(F("  remaining qCount="));
+        Serial.println(qCount);
+#endif
+    }
+
+    if (millis() - lastSendMs < MODULE_GAP_MS) return;  // 간격 대기 — 비블로킹
+
+    if (curJob.target == 0) {
+        // 전체 송신: 모듈 1개씩 진행
+        if (sendIrSignal(allIndex, curJob.protocol, curJob.address, curJob.command)) allOk++;
+        lastSendMs = millis();
+        if (++allIndex >= IR_MODULE_COUNT) {
+            jobActive = false;
+#if IR_TRACE
+            doneSeq++;
+            Serial.print(F("[JOB DONE #"));
+            Serial.print(doneSeq);
+            Serial.print(F("] all-send ok="));
+            Serial.print(allOk);
+            Serial.print(F("/"));
+            Serial.println(IR_MODULE_COUNT);
+#endif
+        }
+    } else {
+        // 단일 송신
+        sendIrSignal(curJob.target - 1, curJob.protocol, curJob.address, curJob.command);
+        lastSendMs = millis();
+        jobActive = false;
+#if IR_TRACE
+        doneSeq++;
+        Serial.print(F("[JOB DONE #"));
+        Serial.print(doneSeq);
+        Serial.print(F("] single target="));
+        Serial.println(curJob.target);
+#endif
+    }
 }
 
 // ─────────── HTTP 응답 헬퍼 ───────────
@@ -334,7 +496,34 @@ void sendModuleStatusJson(EthernetClient& client, uint8_t idx) {
 
 void handleGetStatus(EthernetClient& client) {
     sendHttpHeader(client, 200, "OK", "application/json; charset=utf-8");
-    client.print(F("{\"status\":\"ok\",\"modules\":["));
+
+    // 큐/진행 상태
+    bool    allActive = jobActive && curJob.target == 0;
+    uint8_t sent  = allActive ? allIndex : (jobActive ? 0 : 0);
+    uint8_t total = allActive ? IR_MODULE_COUNT : (jobActive ? 1 : 0);
+
+    client.print(F("{\"status\":\"ok\",\"queue\":{\"pending\":"));
+    client.print(qCount);
+    client.print(F(",\"active\":"));
+    client.print(jobActive ? F("true") : F("false"));
+    client.print(F(",\"target\":"));
+    client.print(jobActive ? curJob.target : 0);
+    client.print(F(",\"sent\":"));
+    client.print(sent);
+    client.print(F(",\"total\":"));
+    client.print(total);
+#if IR_TRACE
+    // 누적 카운터(유실 진단) — req: 수신, enq: 적재, full: 포화거절, done: 완료
+    client.print(F(",\"req\":"));
+    client.print(reqSeq);
+    client.print(F(",\"enq\":"));
+    client.print(enqSeq);
+    client.print(F(",\"full\":"));
+    client.print(fullSeq);
+    client.print(F(",\"done\":"));
+    client.print(doneSeq);
+#endif
+    client.print(F("},\"modules\":["));
     for (uint8_t i = 0; i < IR_MODULE_COUNT; i++) {
         if (i > 0) client.print(',');
         sendModuleStatusJson(client, i);
@@ -406,27 +595,27 @@ void handleSendIr(EthernetClient& client, const char* body,
         return;
     }
 
-    if (singleId > 0) {
-        // 단일 모듈 송신
-        if (sendIrSignal(singleId - 1, protocol, address, command)) {
-            sendJsonOk(client, "IR signal sent");
-        } else {
-            sendJsonError(client, 400, "Bad Request", "Send failed");
-        }
-    } else {
-        // 전체 모듈 송신
-        uint8_t ok = 0;
-        for (uint8_t i = 0; i < IR_MODULE_COUNT; i++) {
-            if (sendIrSignal(i, protocol, address, command)) ok++;
-            delay(20); // 모듈 간 간격
-        }
-        if (ok == IR_MODULE_COUNT) {
-            sendJsonOk(client, "All modules sent");
-        } else {
-            sendJsonError(client, 500, "Internal Server Error",
-                          "Some modules failed");
-        }
+    // 프로토콜 문자열 → enum (1회 파싱). 미지원이면 적재 전 거절.
+    IrProtocol proto = protocolFromString(protocol);
+    if (proto == PROTO_UNKNOWN) {
+        sendJsonError(client, 400, "Bad Request", "Unknown protocol");
+        return;
     }
+
+    // 핸들러는 적재만 — 실제 송신은 serviceIrQueue()에서 수행
+    IrJob job;
+    job.target   = singleId;   // 0 = 전체, 1..15 = 단일
+    job.protocol = (uint8_t)proto;
+    job.address  = address;
+    job.command  = command;
+
+    if (!enqueueJob(job)) {
+        Serial.println(F("IR queue full — request rejected"));
+        sendJsonError(client, 503, "Service Unavailable", "Queue full");
+        return;
+    }
+
+    sendJsonOk(client, "queued");
 }
 
 // ─────────── 클라이언트 정리 ───────────
@@ -515,6 +704,9 @@ void loop() {
     // Ethernet 링크 유지
     Ethernet.maintain();
 
+    // IR 작업 큐 소비 (비블로킹) — 송신 시점이 아니면 즉시 반환
+    serviceIrQueue();
+
     // 링크 상태 변화 감지 — 연결되는 순간 Serial 출력
     static EthernetLinkStatus lastLink = Unknown;
     EthernetLinkStatus link = Ethernet.linkStatus();
@@ -525,6 +717,9 @@ void loop() {
             Serial.println(Ethernet.localIP());
         } else if (link == LinkOFF) {
             Serial.println(F("Ethernet DISCONNECTED."));
+            // 링크 다운 시 진행 작업/큐 정리 — 끊긴 동안 쌓인 송신을 버린다
+            jobActive = false;
+            qHead = qTail = qCount = 0;
         }
     }
 
@@ -534,7 +729,7 @@ void loop() {
     // ── 헤더 읽기 (최대 512B, SRAM 절약) ──
     char headers[512];
     uint16_t hLen = 0;
-    unsigned long timeout = millis() + 3000;
+    unsigned long timeout = millis() + HEADER_READ_TIMEOUT_MS;
     bool headerEnd = false;
 
     while (client.connected() && millis() < timeout && !headerEnd) {
@@ -603,7 +798,7 @@ void loop() {
         }
 
         uint16_t bLen = 0;
-        timeout = millis() + 2000;
+        timeout = millis() + BODY_READ_TIMEOUT_MS;
         while ((int)bLen < contentLength && client.connected() && millis() < timeout) {
             if (client.available()) {
                 body[bLen++] = client.read();
@@ -614,6 +809,12 @@ void loop() {
         body[bLen] = '\0';
     }
 
+#if IR_TRACE
+    reqSeq++;
+    Serial.print(F("[REQ #"));
+    Serial.print(reqSeq);
+    Serial.print(F("] "));
+#endif
     Serial.print(method);
     Serial.print(' ');
     Serial.println(url);
