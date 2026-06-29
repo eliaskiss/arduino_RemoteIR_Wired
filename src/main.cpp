@@ -460,13 +460,9 @@ bool jsonGetString(const char* json, const char* key, char* out, uint8_t maxLen)
     if (!jsonStart || !jsonEnd) return false;
 
     // search 패턴을 jsonStart ~ jsonEnd 범위 내에서만 찾기
-    const char* p = jsonStart;
-    while (p < jsonEnd) {
-        p = strstr(p, search);
-        if (!p || p > jsonEnd) return false;
-        p += strlen(search);
-        break;
-    }
+    const char* p = strstr(jsonStart, search);
+    if (!p || p > jsonEnd) return false;
+    p += strlen(search);
 
     // ':' 찾기
     const char* colon = strchr(p, ':');
@@ -695,6 +691,7 @@ void setup() {
         }
     } else {
         Serial.println(F("Network mode: STATIC"));
+        // 인자 순서: mac, ip, dns, gateway, subnet (DNS로 게이트웨이 사용)
         Ethernet.begin(mac, ip, gateway, gateway, subnet);
     }
 
@@ -744,6 +741,11 @@ void loop() {
         } else if (link == LinkOFF) {
             Serial.println(F("Ethernet DISCONNECTED."));
             // 링크 다운 시 진행 작업/큐 정리 — 끊긴 동안 쌓인 송신을 버린다
+            if (qCount > 0 || jobActive) {
+                Serial.print(F("  Flushed queue: "));
+                Serial.print(qCount + (jobActive ? 1 : 0));
+                Serial.println(F(" job(s) discarded"));
+            }
             jobActive = false;
             qHead = qTail = qCount = 0;
         }
@@ -755,6 +757,7 @@ void loop() {
     // ── 헤더 읽기 (최대 512B, SRAM 절약) ──
     char headers[512];
     uint16_t hLen = 0;
+    bool headerOverflow = false;
     unsigned long timeout = millis() + HEADER_READ_TIMEOUT_MS;
     bool headerEnd = false;
 
@@ -764,6 +767,8 @@ void loop() {
             if (hLen < sizeof(headers) - 1) {
                 headers[hLen++] = c;
                 headers[hLen] = '\0';
+            } else {
+                headerOverflow = true;
             }
             if (hLen >= 4 &&
                 headers[hLen-4] == '\r' && headers[hLen-3] == '\n' &&
@@ -776,6 +781,13 @@ void loop() {
     }
 
     if (hLen == 0) {
+        drainAndClose(client);
+        return;
+    }
+
+    if (headerOverflow) {
+        sendJsonError(client, 431, "Request Header Fields Too Large",
+                      "Header exceeds 512 bytes");
         drainAndClose(client);
         return;
     }
@@ -833,6 +845,14 @@ void loop() {
             }
         }
         body[bLen] = '\0';
+
+        // body 수신 불완전 — 타임아웃 또는 연결 끊김으로 Content-Length만큼 못 받음
+        if ((int)bLen < contentLength) {
+            sendJsonError(client, 400, "Bad Request",
+                          "Incomplete body received");
+            drainAndClose(client);
+            return;
+        }
     }
 
 #if IR_TRACE
