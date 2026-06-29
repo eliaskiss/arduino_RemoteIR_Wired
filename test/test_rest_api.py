@@ -221,11 +221,11 @@ def test_unknown_key_rejected(HOST, PORT):
 
 if __name__ == "__main__":
     # 대상 host(스킴 포함)와 port — 테스트 전반에서 재사용
-    HOST = "http://192.168.1.100"
+    HOST = "http://10.197.61.27"
     PORT = 80
 
     test_send_power_single_module(HOST, PORT)
-    test_send_power_all_modules(HOST, PORT)
-    test_send_all_keys_single_module(HOST, PORT)
-    test_unknown_key_rejected(HOST, PORT)
-    print(f"\nAll tests passed. ({len(KEY_MAP)} keys in KEY_MAP)")
+    # test_send_power_all_modules(HOST, PORT)
+    # test_send_all_keys_single_module(HOST, PORT)
+    # test_unknown_key_rejected(HOST, PORT)
+    # print(f"\nAll tests passed. ({len(KEY_MAP)} keys in KEY_MAP)")

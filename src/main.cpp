@@ -26,8 +26,16 @@
 // USE_DHCP == false : 아래 static ip/gateway/subnet 사용 (기본값, 기존 동작)
 constexpr bool USE_DHCP = false;
 
-byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x04 };
-IPAddress ip(192, 168, 0, 74);
+// byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01 };
+// IPAddress ip(10,197,61,27); // #1
+// byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x02 };
+// IPAddress ip(10,197,61,28); // #2
+// byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x03 };
+// IPAddress ip(10,197,61,29); // #3
+
+byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x05 };
+IPAddress ip(192,168,0,75); // #5
+
 IPAddress gateway(192, 168, 0, 1);
 IPAddress subnet(255, 255, 255, 0);
 
@@ -445,16 +453,34 @@ void sendJsonError(EthernetClient& client, int code, const char* status,
 bool jsonGetString(const char* json, const char* key, char* out, uint8_t maxLen) {
     char search[32];
     snprintf(search, sizeof(search), "\"%s\"", key);
-    const char* p = strstr(json, search);
-    if (!p) return false;
-    p = strchr(p + strlen(search), ':');
-    if (!p) return false;
-    p++;
-    while (*p == ' ' || *p == '\t') p++;
+
+    // JSON 본문의 시작과 끝 찾기 ('{' ~ '}')
+    const char* jsonStart = strchr(json, '{');
+    const char* jsonEnd = strchr(json, '}');
+    if (!jsonStart || !jsonEnd) return false;
+
+    // search 패턴을 jsonStart ~ jsonEnd 범위 내에서만 찾기
+    const char* p = jsonStart;
+    while (p < jsonEnd) {
+        p = strstr(p, search);
+        if (!p || p > jsonEnd) return false;
+        p += strlen(search);
+        break;
+    }
+
+    // ':' 찾기
+    const char* colon = strchr(p, ':');
+    if (!colon || colon > jsonEnd) return false;
+    p = colon + 1;
+
+    // 공백 스킵
+    while (*p && (*p == ' ' || *p == '\t')) p++;
+
+    // 따옴표로 시작하는 문자열 값 파싱
     if (*p == '"') {
         p++;
         uint8_t i = 0;
-        while (*p && *p != '"' && i < maxLen - 1) {
+        while (*p && *p != '"' && *p != '\r' && *p != '\n' && i < maxLen - 1) {
             out[i++] = *p++;
         }
         out[i] = '\0';
